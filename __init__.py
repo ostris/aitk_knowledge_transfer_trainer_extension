@@ -5,10 +5,10 @@ from toolkit.extension import Extension
 # This is for generic training (LoRA, Dreambooth, FineTuning)
 class KnowledgeTransferExtension(Extension):
     # uid must be unique, it is how the extension is identified
-    uid = "sd_trainer"
+    uid = "knowledge_transfer"
 
     # name is the name of the extension for printing
-    name = "SD Trainer"
+    name = "Knowledge Transfer Trainer"
 
     # This is where your process class is loaded
     # keep your imports in here so they don't slow down the rest of the program

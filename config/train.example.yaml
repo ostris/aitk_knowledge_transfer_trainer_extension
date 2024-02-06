@@ -1,10 +1,10 @@
 ---
 job: extension
 config:
-  name: test_v1
+  name: test_transfer_v1
   process:
-    - type: 'textual_inversion_trainer'
-      training_folder: "out/TI"
+    - type: 'knowledge_transfer'
+      training_folder: "out/fine-tune"
       device: cuda:0
       # for tensorboard logging
       log_dir: "out/.tensorboard"
@@ -15,11 +15,11 @@ config:
         save_format: "safetensors"  # 'safetensors' or 'pt'
       save:
         dtype: float16 # precision to save
-        save_every: 100 # save every this many steps
+        save_every: 50 # save every this many steps
         max_step_saves_to_keep: 5 # only affects step counts
       datasets:
         - folder_path: "/path/to/dataset"
-          caption_type: "txt"
+          caption_ext: "txt"
           default_caption: "[trigger]"
           buckets: true
           resolution: 512

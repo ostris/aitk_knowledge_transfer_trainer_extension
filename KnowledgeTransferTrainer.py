@@ -1,11 +1,17 @@
 from collections import OrderedDict
+from typing import Optional
+
 from torch.utils.data import DataLoader
-from toolkit.prompt_utils import concat_prompt_embeds, split_prompt_embeds
-from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
+
+from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+from toolkit.clip_vision_adapter import ClipVisionAdapter
+from toolkit.config_modules import ModelConfig
+from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+from toolkit.prompt_utils import concat_prompt_embeds, split_prompt_embeds, PromptEmbeds
+from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork, UNET_IN_CHANNELS
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight
 import gc
 import torch
-from jobs.process import BaseSDTrainProcess
 
 
 def flush():
@@ -13,162 +19,109 @@ def flush():
     gc.collect()
 
 
-class KnowledgeTransferTrainer(BaseSDTrainProcess):
-    sd: StableDiffusion
-    data_loader: DataLoader = None
-
+class KnowledgeTransferTrainer(SDTrainer):
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
-        pass
+        model_source_config = self.config.get('model_source', None)
+        self.model_source_config = ModelConfig(**model_source_config)
+        self.device2 = self.get_conf('device_2', self.device)
+        self.device2_dtype = self.get_conf('device2_dtype', self.train_config.dtype)
+        self.device2_torch = torch.device(self.device2)
+        self.do_prior_prediction = True
+        self.caption_list = []
+
+        self.sd_source = StableDiffusion(
+            device=self.device2,
+            model_config=self.model_source_config,
+            dtype=self.device2_dtype,
+        )
 
     def before_model_load(self):
         pass
 
     def hook_before_train_loop(self):
+        super().hook_before_train_loop()
         self.sd.vae.eval()
         self.sd.vae.to(self.device_torch)
 
-        # textual inversion
-        if self.embedding is not None:
-            # keep original embeddings as reference
-            self.orig_embeds_params = self.sd.text_encoder.get_input_embeddings().weight.data.clone()
-            # set text encoder to train. Not sure if this is necessary but diffusers example did it
-            self.sd.text_encoder.train()
+        # setup source model
+        self.sd_source.load_model()
+        te_list = [self.sd_source.text_encoder]
+        if isinstance(self.sd_source.text_encoder, list):
+            te_list = self.sd_source.text_encoder
+        for te in te_list:
+            te.eval()
+            te.to(self.device2_torch)
+        self.sd_source.unet.eval()
+        self.sd_source.unet.to(self.device2_torch)
+        self.sd_source.vae.to(self.device2_torch)
+        self.sd_source.vae.eval()
 
-    def hook_train_loop(self, batch):
-        with torch.no_grad():
-            imgs, prompts, dataset_config = batch
+        if self.train_config.xformers:
+            self.sd_source.vae.set_use_memory_efficient_attention_xformers(True)
+            self.sd_source.unet.enable_xformers_memory_efficient_attention()
+        if self.train_config.gradient_checkpointing:
+            self.sd_source.unet.enable_gradient_checkpointing()
 
-            # convert the 0 or 1 for is reg to a bool list
-            is_reg_list = dataset_config.get('is_reg', [0 for _ in range(imgs.shape[0])])
-            if isinstance(is_reg_list, torch.Tensor):
-                is_reg_list = is_reg_list.numpy().tolist()
-            is_reg_list = [bool(x) for x in is_reg_list]
-
-            conditioned_prompts = []
-
-            for prompt, is_reg in zip(prompts, is_reg_list):
-
-                # make sure the embedding is in the prompts
-                if self.embedding is not None:
-                    prompt = self.embedding.inject_embedding_to_prompt(
-                        prompt,
-                        expand_token=True,
-                        add_if_not_present=True,
-                    )
-
-                # make sure trigger is in the prompts if not a regularization run
-                if self.trigger_word is not None and not is_reg:
-                    prompt = self.sd.inject_trigger_into_prompt(
-                        prompt,
-                        add_if_not_present=True,
-                    )
-                conditioned_prompts.append(prompt)
-
-            batch_size = imgs.shape[0]
-
-            dtype = get_torch_dtype(self.train_config.dtype)
-            imgs = imgs.to(self.device_torch, dtype=dtype)
-            latents = self.sd.encode_images(imgs)
-
-            noise_scheduler = self.sd.noise_scheduler
-            optimizer = self.optimizer
-            lr_scheduler = self.lr_scheduler
-
-            self.sd.noise_scheduler.set_timesteps(
-                self.train_config.max_denoising_steps, device=self.device_torch
-            )
-
-            timesteps = torch.randint(0, self.train_config.max_denoising_steps, (batch_size,), device=self.device_torch)
-            timesteps = timesteps.long()
-
-            # get noise
-            noise = self.sd.get_latent_noise(
-                pixel_height=imgs.shape[2],
-                pixel_width=imgs.shape[3],
-                batch_size=batch_size,
-                noise_offset=self.train_config.noise_offset
-            ).to(self.device_torch, dtype=dtype)
-
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            # remove grads for these
-            noisy_latents.requires_grad = False
-            noise.requires_grad = False
-
-        flush()
-
-        self.optimizer.zero_grad()
-
-        # text encoding
-        grad_on_text_encoder = False
-        if self.train_config.train_text_encoder:
-            grad_on_text_encoder = True
-
-        if self.embedding:
-            grad_on_text_encoder = True
-
-        # have a blank network so we can wrap it in a context and set multipliers without checking every time
+    def get_prior_prediction(
+            self,
+            noisy_latents: torch.Tensor,
+            conditional_embeds: PromptEmbeds,
+            match_adapter_assist: bool,
+            network_weight_list: list,
+            timesteps: torch.Tensor,
+            pred_kwargs: dict,
+            batch: 'DataLoaderBatchDTO',
+            noise: torch.Tensor,
+            unconditional_embeds: Optional[PromptEmbeds] = None,
+            conditioned_prompts=None,
+            **kwargs
+    ):
+        is_reg = any(batch.get_is_reg_list())
+        if is_reg:
+            return None
+        # todo for embeddings, we need to run without trigger words
+        was_unet_training = self.sd.unet.training
+        was_network_active = False
         if self.network is not None:
-            network = self.network
-        else:
-            network = BlankNetwork()
+            was_network_active = self.network.is_active
+            self.network.is_active = False
+        can_disable_adapter = False
+        was_adapter_active = False
 
-        # activate network if it exits
-        with network:
-            with torch.set_grad_enabled(grad_on_text_encoder):
-                embedding_list = []
-                # embed the prompts
-                for prompt in conditioned_prompts:
-                    embedding = self.sd.encode_prompt(prompt).to(self.device_torch, dtype=dtype)
-                    embedding_list.append(embedding)
-                conditional_embeds = concat_prompt_embeds(embedding_list)
+        with torch.no_grad():
+            dtype = get_torch_dtype(self.train_config.dtype)
 
-            noise_pred = self.sd.predict_noise(
-                latents=noisy_latents.to(self.device_torch, dtype=dtype),
-                conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
+            embeds_to_use = conditional_embeds.clone().detach()
+            # self.network.multiplier = 0.0
+            self.sd.unet.eval()
+
+            embeds = self.sd_source.encode_prompt(
+                conditioned_prompts,
+                long_prompts=self.do_long_prompts).to(
+                self.device_torch,
+                dtype=dtype).detach()
+
+            prior_pred = self.sd_source.predict_noise(
+                latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
+                conditional_embeddings=embeds.to(self.device_torch, dtype=dtype).detach(),
+                unconditional_embeddings=unconditional_embeds,
                 timestep=timesteps,
-                guidance_scale=1.0,
+                guidance_scale=self.train_config.cfg_scale,
+                **pred_kwargs  # adapter residuals in here
             )
+            if was_unet_training:
+                self.sd.unet.train()
+            prior_pred = prior_pred.detach()
+            # remove the residuals as we wont use them on prediction when matching control
+            if match_adapter_assist and 'down_intrablock_additional_residuals' in pred_kwargs:
+                del pred_kwargs['down_intrablock_additional_residuals']
 
-        noise = noise.to(self.device_torch, dtype=dtype)
+            if can_disable_adapter:
+                self.adapter.is_active = was_adapter_active
+            # restore network
+            # self.network.multiplier = network_weight_list
+            if self.network is not None:
+                self.network.is_active = was_network_active
+        return prior_pred
 
-        if self.sd.prediction_type == 'v_prediction':
-            # v-parameterization training
-            target = noise_scheduler.get_velocity(noisy_latents, noise, timesteps)
-        else:
-            target = noise
-
-        loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
-        loss = loss.mean([1, 2, 3])
-
-        if self.train_config.min_snr_gamma is not None and self.train_config.min_snr_gamma > 0.000001:
-            # add min_snr_gamma
-            loss = apply_snr_weight(loss, timesteps, noise_scheduler, self.train_config.min_snr_gamma)
-
-        loss = loss.mean()
-
-        # back propagate loss to free ram
-        loss.backward()
-        flush()
-
-        # apply gradients
-        optimizer.step()
-        optimizer.zero_grad()
-        lr_scheduler.step()
-
-        if self.embedding is not None:
-            # Let's make sure we don't update any embedding weights besides the newly added token
-            index_no_updates = torch.ones((len(self.sd.tokenizer),), dtype=torch.bool)
-            index_no_updates[
-            min(self.embedding.placeholder_token_ids): max(self.embedding.placeholder_token_ids) + 1] = False
-            with torch.no_grad():
-                self.sd.text_encoder.get_input_embeddings().weight[
-                    index_no_updates
-                ] = self.orig_embeds_params[index_no_updates]
-
-        loss_dict = OrderedDict(
-            {'loss': loss.item()}
-        )
-
-        return loss_dict
