@@ -12,9 +12,9 @@ from toolkit.sampler import get_sampler
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork, UNET_IN_CHANNELS
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight
 from diffusers import PixArtTransformer2DModel
-from diffusers import AuraFlowTransformer2DModel, FluxTransformer2DModel
 import gc
 import torch
+from library.model_util import load_vae
 import copy
 
 
@@ -23,23 +23,20 @@ def flush():
     gc.collect()
 
 
-class KnowledgeTransferPruner(SDTrainer):
+class KnowledgeTransferChannelAdder(SDTrainer):
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
         model_source_config = self.config.get('model_source', None)
         self.model_source_config = ModelConfig(**model_source_config)
-        self.device2 = self.get_conf('device2', self.device)
+        self.device2 = self.get_conf('device_2', self.device)
         self.device2_dtype = self.get_conf('device2_dtype', self.train_config.dtype)
         self.device2_torch = torch.device(self.device2)
-        self.load_device2 = self.get_conf('load_device2', self.device2)
-        self.load_device2_torch = torch.device(self.load_device2)
         self.do_prior_prediction = True
         self.step_prediction = self.get_conf('step_prediction', False)
         self.caption_list = []
         self.alternate = self.get_conf('alternate', False)
-        self.num_layers = self.get_conf('num_layers', 28)
-        self.num_single_layers = self.get_conf('num_single_layers', 28)
-        self.random_noise_shift = self.get_conf('random_noise_shift', False)
+        self.num_channels = self.get_conf('num_channels', 16)
+        self.vae_path = self.get_conf('vae_path', None)
 
         sampler = get_sampler(
             self.train_config.noise_scheduler,
@@ -50,87 +47,44 @@ class KnowledgeTransferPruner(SDTrainer):
         )
 
         self.sd_source = StableDiffusion(
-            device=self.load_device2,
+            device=self.device2,
             model_config=self.model_source_config,
             dtype=self.device2_dtype,
-            noise_scheduler=sampler,
-            quantize_device=self.device
+            noise_scheduler=sampler
         )
 
-        # setup source model
-        self.sd_source.load_model()
-        flush()
-        self.sd_source.pipeline.to(self.device2_torch)
-        flush()
-
     def hook_after_model_load(self):
-        if self.sd.is_auraflow:
-            # remove layers if we have more
-            transformer: AuraFlowTransformer2DModel = self.sd.unet
-            transformer_blocks = [x for x in transformer.single_transformer_blocks]
-            if len(transformer_blocks) > self.num_layers:
-                # keep last layer but remove from -2
-                transformer_blocks = transformer_blocks[:self.num_layers - 1] + transformer_blocks[-1:]
-            transformer.single_transformer_blocks = torch.nn.ModuleList(transformer_blocks)
-            transformer.config.num_single_dit_layers = self.num_layers
-            transformer.config['num_single_dit_layers'] = self.num_layers
-        elif self.sd.is_flux:
-            # remove layers if we have more
-            transformer: FluxTransformer2DModel = self.sd.unet
-            transformer_blocks = [x for x in transformer.transformer_blocks]
-            if len(transformer_blocks) > self.num_layers:
-                # keep last layer but remove from -2
-                transformer_blocks = transformer_blocks[:self.num_layers - 1] + transformer_blocks[-1:]
-            transformer.transformer_blocks = torch.nn.ModuleList(transformer_blocks)
-            transformer.config.num_layers = self.num_layers
-            transformer.config['num_layers'] = self.num_layers
+        # patch the model
+        transformer: PixArtTransformer2DModel = self.sd.unet
+        # cat pos_embed.proj.weight 4x on idx 1
+        # cat proj_out.weight 4x on idx 0
+        # cat proj_out.bias 4x on idx 0
+        if transformer.config.in_channels != self.num_channels:
+            num_cats = self.num_channels // transformer.config.in_channels
 
-            # single layers
-            single_transformer_blocks = [x for x in transformer.single_transformer_blocks]
-            if len(single_transformer_blocks) > self.num_single_layers:
-                # keep last layer but remove from -2
-                single_transformer_blocks = single_transformer_blocks[:self.num_single_layers - 1] + single_transformer_blocks[-1:]
-            transformer.single_transformer_blocks = torch.nn.ModuleList(single_transformer_blocks)
-            transformer.config.num_single_layers = self.num_single_layers
-            transformer.config['num_single_layers'] = self.num_single_layers
+            transformer.pos_embed.proj.weight.data = torch.cat([transformer.pos_embed.proj.weight.data] * num_cats, dim=1)
+            transformer.proj_out.weight.data = torch.cat([transformer.proj_out.weight.data] * num_cats, dim=0)
+            transformer.proj_out.bias.data = torch.cat([transformer.proj_out.bias.data] * num_cats, dim=0)
 
-        else:
-            # remove layers if we have more
-            transformer: PixArtTransformer2DModel = self.sd.unet
-            transformer_blocks = [x for x in transformer.transformer_blocks]
-            if len(transformer_blocks) > self.num_layers:
-                # keep last layer but remove from -2
-                transformer_blocks = transformer_blocks[:self.num_layers - 1] + transformer_blocks[-1:]
-            if len(transformer_blocks) < self.num_layers:
-                num_blocks_to_add = self.num_layers - len(transformer_blocks)
-                # clone the middle number of blocks
-                center_block_idx = len(transformer_blocks) // 2
-                start_clone_idx = center_block_idx - num_blocks_to_add // 2
-                if start_clone_idx < 0:
-                    while True:
-                        # copy all blocks into center to expand it
-                        transformer_blocks = transformer_blocks + copy.deepcopy(transformer_blocks)
-                        center_block_idx = len(transformer_blocks) // 2
-                        start_clone_idx = center_block_idx - num_blocks_to_add // 2
-                        if start_clone_idx >= 0:
-                            break
+            transformer.config.in_channels = self.num_channels
+            transformer.config['in_channels'] = self.num_channels
+            transformer.config.out_channels = self.num_channels * 2
+            transformer.config['out_channels'] = self.num_channels * 2
 
-                cloned_blocks = transformer_blocks[start_clone_idx:start_clone_idx + num_blocks_to_add]
-                cloned_blocks = [copy.deepcopy(x) for x in cloned_blocks]
-                # put them in the middle
-                transformer_blocks = transformer_blocks[:center_block_idx] + cloned_blocks + transformer_blocks[center_block_idx:]
-            transformer.transformer_blocks = torch.nn.ModuleList(transformer_blocks)
-            transformer.config.num_layers = self.num_layers
-            transformer.config['num_layers'] = self.num_layers
-
-        flush()
-
+        # hack in the vae after model loads or it will fail
+        if self.vae_path is not None:
+            vae = load_vae(self.vae_path, dtype=get_torch_dtype(self.sd.dtype))
+            vae.to(self.sd.device_torch).eval()
+            self.sd.vae = vae
+            self.sd.pipeline.vae = vae
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.sd.vae.eval()
         self.sd.vae.to(self.device_torch)
 
+        # setup source model
+        self.sd_source.load_model()
         te_list = [self.sd_source.text_encoder]
         if isinstance(self.sd_source.text_encoder, list):
             te_list = self.sd_source.text_encoder
@@ -145,10 +99,8 @@ class KnowledgeTransferPruner(SDTrainer):
         if self.train_config.xformers:
             self.sd_source.vae.set_use_memory_efficient_attention_xformers(True)
             self.sd_source.unet.enable_xformers_memory_efficient_attention()
-        # if self.train_config.gradient_checkpointing:
-        #     self.sd_source.unet.enable_gradient_checkpointing()
-
-        flush()
+        if self.train_config.gradient_checkpointing:
+            self.sd_source.unet.enable_gradient_checkpointing()
 
     def get_prior_prediction(
             self,
@@ -179,6 +131,8 @@ class KnowledgeTransferPruner(SDTrainer):
         was_adapter_active = False
 
         with torch.no_grad():
+            # slice the noisy latents
+            noisy_latents = noisy_latents[:, :self.sd_source.unet.config.in_channels]
             dtype = get_torch_dtype(self.device2_dtype)
             device_torch = self.device2_torch
 
@@ -226,7 +180,11 @@ class KnowledgeTransferPruner(SDTrainer):
             # self.network.multiplier = network_weight_list
             if self.network is not None:
                 self.network.is_active = was_network_active
-        return prior_pred.to(self.sd.device_torch, dtype=get_torch_dtype(self.train_config.dtype)).detach()
+
+            # cat the noisy latents
+            num_cats = self.num_channels // self.sd_source.unet.config.in_channels
+            prior_pred = torch.cat([prior_pred] * num_cats, dim=1)
+        return prior_pred.to(self.sd.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
     def calculate_loss(
             self,
@@ -246,6 +204,14 @@ class KnowledgeTransferPruner(SDTrainer):
         if self.model_source_config.is_v_pred and not self.model_config.is_v_pred:
             noise_pred = self.sd_source.noise_scheduler.get_velocity(batch.latents, noise_pred, timesteps)
 
+        # match the noist latents in the prior pred
+        noisy_latents = noisy_latents[:, :self.sd_source.unet.config.in_channels]
+        noise = noise[:, :self.sd_source.unet.config.in_channels]
+
+        num_cats = self.num_channels // self.sd_source.unet.config.in_channels
+        noisy_latents = torch.cat([noisy_latents] * num_cats, dim=1)
+        noise = torch.cat([noise] * num_cats, dim=1)
+
         return super().calculate_loss(
             noise_pred=noise_pred,
             noise=noise,
@@ -254,5 +220,32 @@ class KnowledgeTransferPruner(SDTrainer):
             batch=batch,
             mask_multiplier=mask_multiplier,
             prior_pred=prior_pred,
+            **kwargs
+        )
+
+    def predict_noise(
+            self,
+            noisy_latents: torch.Tensor,
+            timesteps: Union[int, torch.Tensor] = 1,
+            conditional_embeds: Union[PromptEmbeds, None] = None,
+            unconditional_embeds: Union[PromptEmbeds, None] = None,
+            **kwargs,
+    ):
+        with torch.no_grad():
+            # make them so they are concatenated
+            noisy_latents = noisy_latents[:, :self.sd_source.unet.config.in_channels]
+            num_cats = self.num_channels // self.sd_source.unet.config.in_channels
+            noisy_latents = torch.cat([noisy_latents] * num_cats, dim=1)
+            noisy_latents = noisy_latents.detach()
+
+        dtype = get_torch_dtype(self.train_config.dtype)
+        return self.sd.predict_noise(
+            latents=noisy_latents.to(self.device_torch, dtype=dtype),
+            conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
+            unconditional_embeddings=unconditional_embeds,
+            timestep=timesteps,
+            guidance_scale=self.train_config.cfg_scale,
+            detach_unconditional=False,
+            rescale_cfg=self.train_config.cfg_rescale,
             **kwargs
         )
